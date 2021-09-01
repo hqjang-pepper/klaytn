@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"hash"
 	"sync/atomic"
+	"time"
 
 	"github.com/klaytn/klaytn/common"
 	"github.com/klaytn/klaytn/common/math"
@@ -112,15 +113,15 @@ func NewEVMInterpreter(evm *EVM, cfg *Config) *Interpreter {
 
 ///////////////////////////////////////////////////////
 // OpcodeComputationCostLimit: The below code is commented and will be usd for debugging purposes.
-//var (
-//	prevOp OpCode
-//	globalTimer = time.Now()
-//	opCnt = make([]uint64, 256)
-//	opTime = make([]uint64, 256)
-//	precompiledCnt = make([]uint64, 16)
-//	precompiledTime = make([]uint64, 16)
-//	opDebug = true
-//)
+var (
+	prevOp OpCode
+	globalTimer = time.Now()
+	opCnt = make([]uint64, 256)
+	opTime = make([]uint64, 256)
+	precompiledCnt = make([]uint64, 16)
+	precompiledTime = make([]uint64, 16)
+	opDebug = true
+)
 ///////////////////////////////////////////////////////
 
 // Run loops and evaluates the contract's code with the given input data and returns
@@ -140,27 +141,28 @@ func (in *Interpreter) Run(contract *Contract, input []byte) (ret []byte, err er
 
 	///////////////////////////////////////////////////////
 	// OpcodeComputationCostLimit: The below code is commented and will be usd for debugging purposes.
-	//if opDebug {
-	//	if in.evm.depth == 0 {
-	//		for i := 0; i< 256; i++ {
-	//			opCnt[i] = 0
-	//			opTime[i] = 0
-	//		}
-	//		prevOp = 0
-	//		defer func() {
-	//			for i := 0; i < 256; i++ {
-	//				if opCnt[i] > 0 {
-	//					fmt.Println("op", OpCode(i).String(), "computationCost", in.cfg.JumpTable[i].computationCost, "cnt", opCnt[i], "avg", opTime[i]/opCnt[i])
-	//				}
-	//			}
-	//			for i := 0; i < 16; i++ {
-	//				if precompiledCnt[i] > 0 {
-	//					fmt.Println("precompiled contract addr", i, "cnt", precompiledCnt[i], "avg", precompiledTime[i]/precompiledCnt[i])
-	//				}
-	//			}
-	//		}()
-	//	}
-	//}
+	if opDebug {
+		if in.evm.depth == 0 {
+			for i := 0; i< 256; i++ {
+				opCnt[i] = 0
+				opTime[i] = 0
+			}
+			prevOp = 0
+			defer func() {
+				for i := 0; i < 256; i++ {
+					if opCnt[i] > 0 {
+						fmt.Println("op", OpCode(i).String(), "computationCost", in.cfg.JumpTable[i].computationCost, "cnt", opCnt[i], "avg", opTime[i]/opCnt[i])
+					}
+				}
+				for i := 0; i < 16; i++ {
+					if precompiledCnt[i] > 0 {
+						fmt.Println("precompiled contract addr", i, "cnt", precompiledCnt[i], "avg", precompiledTime[i]/precompiledCnt[i])
+					}
+				}
+				fmt.Println("Total Computation Cost: ", in.evm.opcodeComputationCostSum)
+			}()
+		}
+	}
 	///////////////////////////////////////////////////////
 
 	// Increment the call depth which is restricted to 1024
@@ -221,9 +223,9 @@ func (in *Interpreter) Run(contract *Contract, input []byte) (ret []byte, err er
 
 		///////////////////////////////////////////////////////
 		// OpcodeComputationCostLimit: The below code is commented and will be usd for debugging purposes.
-		//if opDebug {
-		//	prevOp = op
-		//}
+		if opDebug {
+			prevOp = op
+		}
 		///////////////////////////////////////////////////////
 		// Get the operation from the jump table and validate the stack to ensure there are
 		// enough stack items available to perform the operation.
