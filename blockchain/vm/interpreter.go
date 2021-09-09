@@ -262,13 +262,13 @@ func (in *Interpreter) Run(contract *Contract, input []byte) (ret []byte, err er
 		if in.evm.vmConfig.UseOpcodeComputationCost {
 			///////////////////////////////////////////////////////
 			// OpcodeComputationCostLimit: The below code is commented and will be usd for debugging purposes.
-			//if opDebug && prevOp > 0 {
-			//	elapsed := uint64(time.Since(globalTimer).Nanoseconds())
-			//	fmt.Println("[", in.evm.depth, "]", "prevop", prevOp.String(), "-", op.String(),  "computationCost", in.cfg.JumpTable[prevOp].computationCost, "total", in.evm.opcodeComputationCostSum, "elapsed", elapsed)
-			//	opTime[prevOp] += elapsed
-			//	opCnt[prevOp] += 1
-			//}
-			//globalTimer = time.Now()
+			if opDebug && prevOp > 0 {
+				elapsed := uint64(time.Since(globalTimer).Nanoseconds())
+				//fmt.Println("[", in.evm.depth, "]", "prevop", prevOp.String(), "-", op.String(),  "computationCost", in.cfg.JumpTable[prevOp].computationCost, "total", in.evm.opcodeComputationCostSum, "elapsed", elapsed)
+				opTime[prevOp] += elapsed
+				opCnt[prevOp] += 1
+			}
+			globalTimer = time.Now()
 			///////////////////////////////////////////////////////
 			in.evm.opcodeComputationCostSum += operation.computationCost
 			if in.evm.opcodeComputationCostSum > params.OpcodeComputationCostLimit {
