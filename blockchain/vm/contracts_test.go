@@ -360,7 +360,35 @@ func TestEVM_CVE_2021_39137(t *testing.T) {
 		{
 			"delegateCall test",
 			contractAddr.Bytes(),
+
 			hexutil.MustDecode("0x3034526020600760203460045af4602034343e604034f3"),
+			/*
+				// Pseudo code of the decompiled testCode
+				memory[0:0x20] = address(this); // put contract address with padding left zero into the memory
+				delegateCall(gas, 0x04, 0x0, 0x20, 0x07, 0x20);  // operands: gas, to, in offset, in size, out offset, out size
+				memory[0:0x20] = returnDataCopy(); // put the returned data from delegateCall into the memory
+				return memory[0:0x40];
+
+				//Disassembly
+				0000	30 ADDRESS
+				0001	34 CALLVALUE
+				0002	32 MSTORE
+				0003	60 PUSH1 0x20
+				0005	60 PUSH1 0x07
+				0007	60 PUSH1 0x20
+				0009	34 CALLVALUE
+				0010	60 PUSH1 0x04
+				0012	5A GAS
+				0013	F4 DELEGATECALL
+				0014	60 PUSH1 0x20
+				0016	34 CALLVALUE
+				0017	34 CALLVALUE
+				0018	3E RETURNDATACOPY
+				0019	60 PUSH1 0x40
+				0021	34 CALLVALUE
+				0022	F3 RETURN
+
+			*/
 		},
 	}
 
