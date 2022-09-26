@@ -30,9 +30,10 @@ import (
 )
 
 type hasher struct {
-	tmp    sliceBuffer
-	sha    KeccakState
-	onleaf LeafCallback
+	sha      KeccakState
+	tmp      []byte
+	encbuf   rlp.EncoderBuffer
+	parallel bool // Whether to use paralallel threads when hashing
 }
 
 // KeccakState wraps sha3.state. In addition to the usual hash methods, it also supports
@@ -58,15 +59,16 @@ func (b *sliceBuffer) Reset() {
 var hasherPool = sync.Pool{
 	New: func() interface{} {
 		return &hasher{
-			tmp: make(sliceBuffer, 0, 550), // cap is as large as a full fullNode.
-			sha: sha3.NewKeccak256().(KeccakState),
+			tmp:    make([]byte, 0, 550), // cap is as large as a full fullNode.
+			sha:    sha3.NewKeccak256().(KeccakState),
+			encbuf: rlp.NewEncoderBuffer(nil),
 		}
 	},
 }
 
-func newHasher(onleaf LeafCallback) *hasher {
+func newHasher(parallel bool) *hasher {
 	h := hasherPool.Get().(*hasher)
-	h.onleaf = onleaf
+	h.parallel = parallel
 	return h
 }
 
@@ -76,115 +78,155 @@ func returnHasherToPool(h *hasher) {
 
 // hash collapses a node down into a hash node, also returning a copy of the
 // original node initialized with the computed hash to replace the original one.
-func (h *hasher) hash(n node, db *Database, force bool) (node, node) {
-	// If we're not storing the node, just hashing, use available cached data
-	if hash, dirty := n.cache(); hash != nil {
-		if db == nil {
-			return hash, n
-		}
-		if !dirty {
-			switch n.(type) {
-			case *fullNode, *shortNode:
-				return hash, hash
-			default:
-				return hash, n
-			}
-		}
+func (h *hasher) hash(n node, force bool) (hashed node, cached node) {
+	// Return the cached hash if it's available
+	if hash, _ := n.cache(); hash != nil {
+		return hash, n
 	}
-	// Trie not processed yet or needs storage, walk the children
-	collapsed, cached := h.hashChildren(n, db)
-	hashed, lenEncoded := h.store(collapsed, db, force)
-	// Cache the hash of the node for later reuse and remove
-	// the dirty flag in commit mode. It's fine to assign these values directly
-	// without copying the node first because hashChildren copies it.
-	cachedHash, _ := hashed.(hashNode)
-	switch cn := cached.(type) {
+	// Trie not processed yet, walk the children
+	switch n := n.(type) {
 	case *shortNode:
-		cn.flags.hash = cachedHash
-		cn.flags.lenEncoded = lenEncoded
-		if db != nil {
-			cn.flags.dirty = false
+		collapsed, cached := h.hashShortNodeChildren(n)
+		hashed := h.shortnodeToHash(collapsed, force)
+		// We need to retain the possibly _not_ hashed node, in case it was too
+		// small to be hashed
+		if hn, ok := hashed.(hashNode); ok {
+			cached.flags.hash = hn
+		} else {
+			cached.flags.hash = nil
 		}
+		return hashed, cached
 	case *fullNode:
-		cn.flags.hash = cachedHash
-		cn.flags.lenEncoded = lenEncoded
-		if db != nil {
-			cn.flags.dirty = false
+		collapsed, cached := h.hashFullNodeChildren(n)
+		hashed = h.fullnodeToHash(collapsed, force)
+		if hn, ok := hashed.(hashNode); ok {
+			cached.flags.hash = hn
+		} else {
+			cached.flags.hash = nil
 		}
-	}
-	return hashed, cached
-}
-
-func (h *hasher) hashRoot(n node, db *Database, force bool) (node, node) {
-	// If we're not storing the node, just hashing, use available cached data
-	if hash, dirty := n.cache(); hash != nil {
-		if db == nil {
-			return hash, n
-		}
-		if !dirty {
-			switch n.(type) {
-			case *fullNode, *shortNode:
-				return hash, hash
-			default:
-				return hash, n
-			}
-		}
-	}
-	// Trie not processed yet or needs storage, walk the children
-	collapsed, cached := h.hashChildrenFromRoot(n, db)
-	hashed, lenEncoded := h.store(collapsed, db, force)
-	// Cache the hash of the node for later reuse and remove
-	// the dirty flag in commit mode. It's fine to assign these values directly
-	// without copying the node first because hashChildren copies it.
-	cachedHash, _ := hashed.(hashNode)
-	switch cn := cached.(type) {
-	case *shortNode:
-		cn.flags.hash = cachedHash
-		cn.flags.lenEncoded = lenEncoded
-		if db != nil {
-			cn.flags.dirty = false
-		}
-	case *fullNode:
-		cn.flags.hash = cachedHash
-		cn.flags.lenEncoded = lenEncoded
-		if db != nil {
-			cn.flags.dirty = false
-		}
-	}
-	return hashed, cached
-}
-
-// hashChildren replaces the children of a node with their hashes if the encoded
-// size of the child is larger than a hash, returning the collapsed node as well
-// as a replacement for the original node with the child hashes cached in.
-func (h *hasher) hashChildren(original node, db *Database) (node, node) {
-	switch n := original.(type) {
-	case *shortNode:
-		// Hash the short node's child, caching the newly hashed subtree
-		collapsed, cached := n.copy(), n.copy()
-		collapsed.Key = hexToCompact(n.Key)
-		cached.Key = common.CopyBytes(n.Key)
-
-		if _, ok := n.Val.(valueNode); !ok {
-			collapsed.Val, cached.Val = h.hash(n.Val, db, false)
-		}
-		return collapsed, cached
-
-	case *fullNode:
-		// Hash the full node's children, caching the newly hashed subtrees
-		collapsed, cached := n.copy(), n.copy()
-
-		for i := 0; i < 16; i++ {
-			if n.Children[i] != nil {
-				collapsed.Children[i], cached.Children[i] = h.hash(n.Children[i], db, false)
-			}
-		}
-		cached.Children[16] = n.Children[16]
-		return collapsed, cached
-
+		return hashed, cached
 	default:
 		// Value and hash nodes don't have children so they're left as were
-		return n, original
+		return n, n
+	}
+}
+
+// hashShortNodeChildren collapses the short node. The returned collapsed node
+// holds a live reference to the Key, and must not be modified.
+// The cached
+func (h *hasher) hashShortNodeChildren(n *shortNode) (collapsed, cached *shortNode) {
+	// Hash the short node's child, caching the newly hashed subtree
+	collapsed, cached = n.copy(), n.copy()
+	// Previously, we did copy this one. We don't seem to need to actually
+	// do that, since we don't overwrite/reuse keys
+	//cached.Key = common.CopyBytes(n.Key)
+	collapsed.Key = hexToCompact(n.Key)
+	// Unless the child is a valuenode or hashnode, hash it
+	switch n.Val.(type) {
+	case *fullNode, *shortNode:
+		collapsed.Val, cached.Val = h.hash(n.Val, false)
+	}
+	return collapsed, cached
+}
+
+func (h *hasher) hashFullNodeChildren(n *fullNode) (collapsed *fullNode, cached *fullNode) {
+	// Hash the full node's children, caching the newly hashed subtrees
+	cached = n.copy()
+	collapsed = n.copy()
+	if h.parallel {
+		var wg sync.WaitGroup
+		wg.Add(16)
+		for i := 0; i < 16; i++ {
+			go func(i int) {
+				hasher := newHasher(false)
+				if child := n.Children[i]; child != nil {
+					collapsed.Children[i], cached.Children[i] = hasher.hash(child, false)
+				} else {
+					collapsed.Children[i] = nilValueNode
+				}
+				returnHasherToPool(hasher)
+				wg.Done()
+			}(i)
+		}
+		wg.Wait()
+	} else {
+		for i := 0; i < 16; i++ {
+			if child := n.Children[i]; child != nil {
+				collapsed.Children[i], cached.Children[i] = h.hash(child, false)
+			} else {
+				collapsed.Children[i] = nilValueNode
+			}
+		}
+	}
+	return collapsed, cached
+}
+
+// shortnodeToHash creates a hashNode from a shortNode. The supplied shortnode
+// should have hex-type Key, which will be converted (without modification)
+// into compact form for RLP encoding.
+// If the rlp data is smaller than 32 bytes, `nil` is returned.
+func (h *hasher) shortnodeToHash(n *shortNode, force bool) node {
+	n.encode(h.encbuf)
+	enc := h.encodedBytes()
+
+	if len(enc) < 32 && !force {
+		return n // Nodes smaller than 32 bytes are stored inside their parent
+	}
+	return h.hashData(enc)
+}
+
+// shortnodeToHash is used to creates a hashNode from a set of hashNodes, (which
+// may contain nil values)
+func (h *hasher) fullnodeToHash(n *fullNode, force bool) node {
+	n.encode(h.encbuf)
+	enc := h.encodedBytes()
+
+	if len(enc) < 32 && !force {
+		return n // Nodes smaller than 32 bytes are stored inside their parent
+	}
+	return h.hashData(enc)
+}
+
+// encodedBytes returns the result of the last encoding operation on h.encbuf.
+// This also resets the encoder buffer.
+//
+// All node encoding must be done like this:
+//
+//     node.encode(h.encbuf)
+//     enc := h.encodedBytes()
+//
+// This convention exists because node.encode can only be inlined/escape-analyzed when
+// called on a concrete receiver type.
+func (h *hasher) encodedBytes() []byte {
+	h.tmp = h.encbuf.AppendToBytes(h.tmp[:0])
+	h.encbuf.Reset(nil)
+	return h.tmp
+}
+
+// hashData hashes the provided data
+func (h *hasher) hashData(data []byte) hashNode {
+	n := make(hashNode, 32)
+	h.sha.Reset()
+	h.sha.Write(data)
+	h.sha.Read(n)
+	return n
+}
+
+// proofHash is used to construct trie proofs, and returns the 'collapsed'
+// node (for later RLP encoding) aswell as the hashed node -- unless the
+// node is smaller than 32 bytes, in which case it will be returned as is.
+// This method does not do anything on value- or hash-nodes.
+func (h *hasher) proofHash(original node) (collapsed, hashed node) {
+	switch n := original.(type) {
+	case *shortNode:
+		sn, _ := h.hashShortNodeChildren(n)
+		return sn, h.shortnodeToHash(sn, false)
+	case *fullNode:
+		fn, _ := h.hashFullNodeChildren(n)
+		return fn, h.fullnodeToHash(fn, false)
+	default:
+		// Value and hash nodes don't have children so they're left as were
+		return n, n
 	}
 }
 
@@ -203,7 +245,7 @@ func (h *hasher) hashChildrenFromRoot(original node, db *Database) (node, node) 
 		cached.Key = common.CopyBytes(n.Key)
 
 		if _, ok := n.Val.(valueNode); !ok {
-			collapsed.Val, cached.Val = h.hash(n.Val, db, false)
+			collapsed.Val, cached.Val = h.hash(n.Val, false)
 		}
 		return collapsed, cached
 
@@ -217,9 +259,9 @@ func (h *hasher) hashChildrenFromRoot(original node, db *Database) (node, node) 
 			if n.Children[i] != nil {
 				numRootChildren++
 				go func(i int, n node) {
-					childHasher := newHasher(h.onleaf)
+					childHasher := newHasher(false)
 					defer returnHasherToPool(childHasher)
-					collapsedFromChild, cachedFromChild := childHasher.hash(n, db, false)
+					collapsedFromChild, cachedFromChild := childHasher.hash(n, false)
 					hashResultCh <- hashResult{i, collapsedFromChild, cachedFromChild}
 				}(i, n.Children[i])
 			}
@@ -238,58 +280,6 @@ func (h *hasher) hashChildrenFromRoot(original node, db *Database) (node, node) 
 		// Value and hash nodes don't have children so they're left as were
 		return n, original
 	}
-}
-
-// store hashes the node n and if we have a storage layer specified, it writes
-// the key/value pair to it and tracks any node->child references as well as any
-// node->external trie references.
-func (h *hasher) store(n node, db *Database, force bool) (node, uint16) {
-	// Don't store hashes or empty nodes.
-	if _, isHash := n.(hashNode); n == nil || isHash {
-		return n, 0
-	}
-	hash, _ := n.cache()
-	lenEncoded := n.lenEncoded()
-	if hash == nil || lenEncoded == 0 {
-		// Generate the RLP encoding of the node
-		h.tmp.Reset()
-		if err := rlp.Encode(&h.tmp, n); err != nil {
-			panic("encode error: " + err.Error())
-		}
-
-		lenEncoded = uint16(len(h.tmp))
-	}
-	if lenEncoded < 32 && !force {
-		return n, lenEncoded // Nodes smaller than 32 bytes are stored inside their parent
-	}
-	if hash == nil {
-		hash = h.makeHashNode(h.tmp)
-	}
-	if db != nil {
-		// We are pooling the trie nodes into an intermediate memory cache
-		hash := common.BytesToHash(hash)
-
-		db.lock.Lock()
-		db.insert(hash, lenEncoded, n)
-		db.lock.Unlock()
-
-		// Track external references from account->storage trie
-		if h.onleaf != nil {
-			switch n := n.(type) {
-			case *shortNode:
-				if child, ok := n.Val.(valueNode); ok {
-					h.onleaf(nil, nil, child, hash, 0)
-				}
-			case *fullNode:
-				for i := 0; i < 16; i++ {
-					if child, ok := n.Children[i].(valueNode); ok {
-						h.onleaf(nil, nil, child, hash, 0)
-					}
-				}
-			}
-		}
-	}
-	return hash, lenEncoded
 }
 
 func (h *hasher) makeHashNode(data []byte) hashNode {

@@ -62,7 +62,13 @@ type Trie struct {
 	db           *Database
 	root         node
 	originalRoot common.Hash
-	prefetching  bool
+
+	// Keep track of the number leaves which have been inserted since the last
+	// hashing operation. This number will not directly map to the number of
+	// actually unhashed nodes
+	unhashed int
+
+	prefetching bool
 }
 
 // newFlag returns the cache flag value for a newly created node.
@@ -517,7 +523,7 @@ func (t *Trie) resolveHash(n hashNode, prefix []byte) (node, error) {
 // Hash returns the root hash of the trie. It does not write to the
 // database and can be used even if the trie doesn't have one.
 func (t *Trie) Hash() common.Hash {
-	hash, cached := t.hashRoot(nil, nil)
+	hash, cached, _ := t.hashRoot()
 	t.root = cached
 	return common.BytesToHash(hash.(hashNode))
 }
@@ -528,23 +534,27 @@ func (t *Trie) Commit(onleaf LeafCallback) (root common.Hash, err error) {
 	if t.db == nil {
 		panic("commit called on trie with nil database")
 	}
-	hash, cached := t.hashRoot(t.db, onleaf)
+	hash, cached, _ := t.hashRoot()
 	t.root = cached
 	return common.BytesToHash(hash.(hashNode)), nil
 }
 
-func (t *Trie) hashRoot(db *Database, onleaf LeafCallback) (node, node) {
+// hashRoot calculates the root hash of the given trie
+func (t *Trie) hashRoot() (node, node, error) {
 	if t.root == nil {
-		return hashNode(emptyRoot.Bytes()), nil
+		return hashNode(emptyRoot.Bytes()), nil, nil
 	}
-	h := newHasher(onleaf)
+	// If the number of changes is below 100, we let one thread handle it
+	h := newHasher(t.unhashed >= 100)
 	defer returnHasherToPool(h)
-	return h.hashRoot(t.root, db, true)
+	hashed, cached := h.hash(t.root, true)
+	t.unhashed = 0
+	return hashed, cached, nil
 }
 
 func GetHashAndHexKey(key []byte) ([]byte, []byte) {
 	var hashKeyBuf [common.HashLength]byte
-	h := newHasher(nil)
+	h := newHasher(false)
 	h.sha.Reset()
 	h.sha.Write(key)
 	hashKey := h.sha.Sum(hashKeyBuf[:0])

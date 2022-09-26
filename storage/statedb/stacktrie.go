@@ -30,7 +30,6 @@ import (
 	"sync"
 
 	"github.com/klaytn/klaytn/common"
-	"github.com/klaytn/klaytn/rlp"
 	"github.com/klaytn/klaytn/storage/database"
 )
 
@@ -372,100 +371,96 @@ func (st *StackTrie) insert(key, value []byte) {
 //  - Then the <32 byte rlp-encoded value will be accessible in 'st.val'.
 //  - And the 'st.type' will be 'hashedNode' AGAIN
 //
-// This method will also:
-// set 'st.type' to hashedNode
-// clear 'st.key'
+
+// This method also sets 'st.type' to hashedNode, and clears 'st.key'.
 func (st *StackTrie) hash() {
-	/* Shortcut if node is already hashed */
-	if st.nodeType == hashedNode {
-		return
-	}
-	// The 'hasher' is taken from a pool, but we don't actually
-	// claim an instance until all children are done with their hashing,
-	// and we actually need one
-	var h *hasher
+	h := newHasher(false)
+	defer returnHasherToPool(h)
+
+	st.hashRec(h)
+}
+
+func (st *StackTrie) hashRec(hasher *hasher) {
+	// The switch below sets this to the RLP-encoding of this node.
+	var encodedNode []byte
 
 	switch st.nodeType {
-	case branchNode:
-		var nodes [17]node
-		for i, child := range st.children {
-			if child == nil {
-				nodes[i] = nilValueNode
-				continue
-			}
-			child.hash()
-			if len(child.val) < 32 {
-				nodes[i] = rawNode(child.val)
-			} else {
-				nodes[i] = hashNode(child.val)
-			}
-			st.children[i] = nil // Reclaim mem from subtree
-			returnToPool(child)
-		}
-		nodes[16] = nilValueNode
-		h = newHasher(nil)
-		defer returnHasherToPool(h)
-		h.tmp.Reset()
-		if err := rlp.Encode(&h.tmp, nodes); err != nil {
-			panic(err)
-		}
-	case extNode:
-		st.children[0].hash()
-		h = newHasher(nil)
-		defer returnHasherToPool(h)
-		h.tmp.Reset()
-		var valuenode node
-		if len(st.children[0].val) < 32 {
-			valuenode = rawNode(st.children[0].val)
-		} else {
-			valuenode = hashNode(st.children[0].val)
-		}
-		n := struct {
-			Key []byte
-			Val node
-		}{
-			Key: hexToCompact(st.key),
-			Val: valuenode,
-		}
-		if err := rlp.Encode(&h.tmp, n); err != nil {
-			panic(err)
-		}
-		returnToPool(st.children[0])
-		st.children[0] = nil // Reclaim mem from subtree
-	case leafNode:
-		h = newHasher(nil)
-		defer returnHasherToPool(h)
-		h.tmp.Reset()
-		st.key = append(st.key, byte(16))
-		sz := hexToCompactInPlace(st.key)
-		n := [][]byte{st.key[:sz], st.val}
-		if err := rlp.Encode(&h.tmp, n); err != nil {
-			panic(err)
-		}
+	case hashedNode:
+		return
+
 	case emptyNode:
 		st.val = emptyRoot.Bytes()
 		st.key = st.key[:0]
 		st.nodeType = hashedNode
 		return
+
+	case branchNode:
+		var nodes rawFullNode
+		for i, child := range st.children {
+			if child == nil {
+				nodes[i] = nilValueNode
+				continue
+			}
+
+			child.hashRec(hasher)
+			if len(child.val) < 32 {
+				nodes[i] = rawNode(child.val)
+			} else {
+				nodes[i] = hashNode(child.val)
+			}
+
+			// Release child back to pool.
+			st.children[i] = nil
+			returnToPool(child)
+		}
+
+		nodes.encode(hasher.encbuf)
+		encodedNode = hasher.encodedBytes()
+
+	case extNode:
+		st.children[0].hashRec(hasher)
+
+		sz := hexToCompactInPlace(st.key)
+		n := rawShortNode{Key: st.key[:sz]}
+		if len(st.children[0].val) < 32 {
+			n.Val = rawNode(st.children[0].val)
+		} else {
+			n.Val = hashNode(st.children[0].val)
+		}
+
+		n.encode(hasher.encbuf)
+		encodedNode = hasher.encodedBytes()
+
+		// Release child back to pool.
+		returnToPool(st.children[0])
+		st.children[0] = nil
+
+	case leafNode:
+		st.key = append(st.key, byte(16))
+		sz := hexToCompactInPlace(st.key)
+		n := rawShortNode{Key: st.key[:sz], Val: valueNode(st.val)}
+
+		n.encode(hasher.encbuf)
+		encodedNode = hasher.encodedBytes()
+
 	default:
-		panic("Invalid node type")
+		panic("invalid node type")
 	}
-	st.key = st.key[:0]
+
 	st.nodeType = hashedNode
-	if len(h.tmp) < 32 {
-		st.val = common.CopyBytes(h.tmp)
+	st.key = st.key[:0]
+	if len(encodedNode) < 32 {
+		st.val = common.CopyBytes(encodedNode)
 		return
 	}
+
 	// Write the hash to the 'val'. We allocate a new val here to not mutate
 	// input values
-	st.val = make([]byte, 32)
-	h.sha.Reset()
-	h.sha.Write(h.tmp)
-	h.sha.Read(st.val)
+	st.val = hasher.hashData(encodedNode)
 	if st.db != nil {
 		// TODO! Is it safe to Put the slice here?
 		// Do all db implementations copy the value provided?
-		st.db.GetStateTrieDB().Put(st.val, h.tmp)
+		st.db.GetStateTrieDB().Put(st.val, encodedNode)
 	}
 }
 
@@ -477,7 +472,7 @@ func (st *StackTrie) Hash() (h common.Hash) {
 		// be hashed, and instead contain the  rlp-encoding of the
 		// node. For the top level node, we need to force the hashing.
 		ret := make([]byte, 32)
-		h := newHasher(nil)
+		h := newHasher(false)
 		defer returnHasherToPool(h)
 		h.sha.Reset()
 		h.sha.Write(st.val)
@@ -504,7 +499,7 @@ func (st *StackTrie) Commit() (common.Hash, error) {
 		// be hashed (and committed), and instead contain the  rlp-encoding of the
 		// node. For the top level node, we need to force the hashing+commit.
 		ret := make([]byte, 32)
-		h := newHasher(nil)
+		h := newHasher(false)
 		defer returnHasherToPool(h)
 		h.sha.Reset()
 		h.sha.Write(st.val)
