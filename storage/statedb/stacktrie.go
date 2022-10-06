@@ -466,20 +466,22 @@ func (st *StackTrie) hashRec(hasher *hasher) {
 
 // Hash returns the hash of the current node
 func (st *StackTrie) Hash() (h common.Hash) {
-	st.hash()
+	hasher := newHasher(false)
+	defer returnHasherToPool(hasher)
+
+	st.hashRec(hasher)
 	if len(st.val) != 32 {
-		// If the node's RLP isn't 32 bytes long, the node will not
-		// be hashed, and instead contain the  rlp-encoding of the
-		// node. For the top level node, we need to force the hashing.
-		ret := make([]byte, 32)
-		h := newHasher(false)
-		defer returnHasherToPool(h)
-		h.sha.Reset()
-		h.sha.Write(st.val)
-		h.sha.Read(ret)
-		return common.BytesToHash(ret)
+		copy(h[:], st.val)
+		return h
 	}
-	return common.BytesToHash(st.val)
+
+	// If the node's RLP isn't 32 bytes long, the node will not
+	// be hashed, and instead contain the  rlp-encoding of the
+	// node. For the top level node, we need to force the hashing.
+	hasher.sha.Reset()
+	hasher.sha.Write(st.val)
+	hasher.sha.Read(h[:])
+	return h
 }
 
 // Commit will firstly hash the entrie trie if it's still not hashed
@@ -489,23 +491,26 @@ func (st *StackTrie) Hash() (h common.Hash) {
 //
 // The associated database is expected, otherwise the whole commit
 // functionality should be disabled.
-func (st *StackTrie) Commit() (common.Hash, error) {
+func (st *StackTrie) Commit() (h common.Hash, err error) {
 	if st.db == nil {
 		return common.Hash{}, ErrCommitDisabled
 	}
-	st.hash()
-	if len(st.val) != 32 {
-		// If the node's RLP isn't 32 bytes long, the node will not
-		// be hashed (and committed), and instead contain the  rlp-encoding of the
-		// node. For the top level node, we need to force the hashing+commit.
-		ret := make([]byte, 32)
-		h := newHasher(false)
-		defer returnHasherToPool(h)
-		h.sha.Reset()
-		h.sha.Write(st.val)
-		h.sha.Read(ret)
-		st.db.GetStateTrieDB().Put(ret, st.val)
-		return common.BytesToHash(ret), nil
+
+	hasher := newHasher(false)
+	defer returnHasherToPool(hasher)
+
+	st.hashRec(hasher)
+	if len(st.val) == 32 {
+		copy(h[:], st.val)
+		return h, nil
 	}
-	return common.BytesToHash(st.val), nil
+
+	// If the node's RLP isn't 32 bytes long, the node will not
+	// be hashed (and committed), and instead contain the  rlp-encoding of the
+	// node. For the top level node, we need to force the hashing+commit.
+	hasher.sha.Reset()
+	hasher.sha.Write(st.val)
+	hasher.sha.Read(h[:])
+	st.db.GetStateTrieDB().Put(h[:], st.val)
+	return h, nil
 }

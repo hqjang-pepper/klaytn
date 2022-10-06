@@ -44,17 +44,6 @@ type KeccakState interface {
 	Read([]byte) (int, error)
 }
 
-type sliceBuffer []byte
-
-func (b *sliceBuffer) Write(data []byte) (n int, err error) {
-	*b = append(*b, data...)
-	return len(data), nil
-}
-
-func (b *sliceBuffer) Reset() {
-	*b = (*b)[:0]
-}
-
 // hashers live in a global db.
 var hasherPool = sync.Pool{
 	New: func() interface{} {
